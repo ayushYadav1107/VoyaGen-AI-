@@ -202,57 +202,24 @@ traceable execution while the state contract was being stabilised.
 
 ## 🔄 Pipeline & Data Flow at a Glance
 
-A wider view of the same graph — each agent, the single tool or model it actually calls, how
-their outputs land in the shared `TravelState`, and how that state is persisted:
+A wider view of the same graph — each agent, the tools/models behind it, how their outputs land
+in the shared `TravelState`, and how that state is persisted:
 
-```mermaid
-flowchart TB
-    subgraph Pipeline["LangGraph Pipeline — sequential execution"]
-        direction LR
-        A1["✈️ 1 · Flight Agent<br/><br/>Resolves origin/destination<br/>to IATA codes and fetches<br/>live flight data"]
-        A2["🏨 2 · Hotel Agent<br/><br/>Searches current lodging<br/>options for the destination"]
-        A3["🗺️ 3 · Itinerary Agent<br/><br/>Drafts a day-wise,<br/>budget-aware plan"]
-        A4["💬 4 · Final Response Agent<br/><br/>Formats the 6-section<br/>final answer"]
-        A1 --> A2 --> A3 --> A4
-    end
-
-    T1["🔧 search_flights()<br/>AviationStack API"]
-    T2["🔧 tavily_search()<br/>Tavily Search API"]
-    T3["🧠 Groq LLM<br/>'expert travel planner' persona"]
-    T4["🧠 Groq LLM<br/>'travel booking assistant' persona"]
-
-    A1 -. calls .-> T1
-    A2 -. calls .-> T2
-    A3 -. calls .-> T3
-    A4 -. calls .-> T4
-
-    A1 --> STATE
-    A2 --> STATE
-    A3 --> STATE
-    A4 --> STATE
-
-    subgraph STATE["🗂️ Shared State — TravelState"]
-        direction LR
-        S1["user_query"]
-        S2["flight_results"]
-        S3["hotel_results"]
-        S4["itinerary"]
-        S5["messages / llm_calls"]
-    end
-
-    STATE --> DB[("🐘 PostgreSQL<br/>Checkpoint store<br/>keyed by thread_id")]
-    DB -. "resume by thread_id" .-> STATE
-```
+<div align="center">
+  <img src="assets/architecture.png" alt="VoyaGen AI multi-agent pipeline: Flight, Hotel, Itinerary, and Final Response agents feeding a shared TravelState that is checkpointed to PostgreSQL" width="100%">
+</div>
 
 **Reading this diagram:**
 
 - Every agent writes into the **same** `TravelState` object rather than passing messages
-  point-to-point — this is what lets `final_agent` see the flight data that `flight_agent`
-  fetched two steps earlier without any node re-fetching or re-deriving it.
-- Only two nodes touch the network for retrieval (`flight_agent` → AviationStack,
-  `hotel_agent` → Tavily); the other two are pure LLM calls over state that already exists.
-  This is the "push facts to tools, reserve the model for synthesis" principle from
-  [Why This Project](#-why-this-project) made concrete.
+  point-to-point — this is what lets the final agent see the flight data fetched two steps
+  earlier without any node re-fetching or re-deriving it.
+- In the current implementation, `flight_agent` calls **AviationStack** and `hotel_agent` calls
+  **Tavily Search**; `itinerary_agent` and `final_agent` are pure Groq LLM calls reasoning over
+  state that already exists — no separate maps/places lookup is wired in yet (see
+  [Roadmap](#-roadmap) for planned Amadeus/date-aware extensions). This is the "push facts to
+  tools, reserve the model for synthesis" principle from [Why This Project](#-why-this-project)
+  made concrete.
 - The state is checkpointed to PostgreSQL after each step, so if the process restarts mid-run,
   a client resuming with the same `thread_id` continues from the last completed node instead
   of losing the conversation.
