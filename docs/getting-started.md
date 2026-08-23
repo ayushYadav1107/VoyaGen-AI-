@@ -150,7 +150,10 @@ python -c "import asyncio, mcp_client; asyncio.run(mcp_client.get_all_tools())"
 | `DB_POOL_MAX_SIZE` | ➖ | `10` | Upper bound on the PostgreSQL connection pool. |
 | `GROQ_MODEL` | ➖ | `openai/gpt-oss-120b` | Any model ID Groq serves. Free-tier token limits differ per model. |
 | `GROQ_TPM_LIMIT` | ➖ | `8000` | **Your account's tokens-per-minute allowance.** Every prompt is budgeted against it — see [Token budgeting](#-token-budgeting). |
-| `GROQ_MAX_COMPLETION_TOKENS` | ➖ | `2000` | Reserved out of the TPM allowance for the model's reply. |
+| `ITINERARY_COMPLETION_TOKENS` | ➖ | `2500` | Reply budget for the draft itinerary. |
+| `FINAL_COMPLETION_TOKENS` | ➖ | `2500` | Reply budget for the final plan. |
+| `GROQ_TPM_UTILISATION` | ➖ | `0.90` | Fraction of the TPM allowance a single request may plan to use. |
+| `MAX_CONTINUATIONS` | ➖ | `3` | Extra rounds allowed to finish a reply that hit its length cap. |
 | `GROQ_MAX_RETRIES` | ➖ | `4` | Attempts before a rate-limited step gives up. |
 | `MAX_ARTIFACT_CHARS` | ➖ | `6000` | Longest per-agent result kept in `TravelState`. |
 | `LANGSMITH_TRACING` | ➖ | — | Set to `true` to enable tracing. |
@@ -171,7 +174,8 @@ OPENWEATHER_API_KEY=...
 # optional
 # optional — raise these together if you are on a paid Groq plan
 # GROQ_TPM_LIMIT=30000
-# GROQ_MAX_COMPLETION_TOKENS=4000
+# ITINERARY_COMPLETION_TOKENS=4000
+# FINAL_COMPLETION_TOKENS=4000
 
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=lsv2_...
@@ -200,14 +204,29 @@ Limit 8000, Requested 11269, please reduce your message size
 
 So `backend.py` budgets every prompt instead of hoping it fits.
 
+Groq screens a request as `prompt_tokens + max_tokens` against the ceiling, so the
+reply reservation and the prompt budget are two halves of one number:
+
 ```mermaid
 flowchart LR
-    A["GROQ_TPM_LIMIT<br/>8,000"] --> B["− GROQ_MAX_COMPLETION_TOKENS<br/>2,000 reserved for the reply"]
-    B --> C["6,000 tokens of input"]
+    A["GROQ_TPM_LIMIT<br/>8,000"] --> B["× GROQ_TPM_UTILISATION<br/>0.90"]
+    B --> C["− this node's reply budget<br/>COMPLETION_TOKENS[label]"]
     C --> D["× CHARS_PER_TOKEN 3<br/>× 0.85 safety margin"]
-    D --> E["≈15,300 characters<br/>per request"]
+    D --> E["character budget<br/>for this prompt"]
     E --> F["_fit_sections()<br/>shares it by weight"]
 ```
+
+Reply budgets are **per node**, because one global cap either truncates the itinerary or
+wastes thousands of tokens on the nodes that answer in strict JSON:
+
+| Node | Reply budget | Why |
+| --- | --: | --- |
+| `guardrail` | 400 | Returns `{allowed, reason}` and nothing else |
+| `supervisor` | 800 | JSON plus a sentence of reasoning |
+| `flight_agent` · `hotel_agent` · `weather_agent` | 1,200 | A short section each |
+| `budget_agent` | 1,500 | Four short analyses |
+| `itinerary_agent` | 2,500 | Writes the full draft |
+| `final_agent` | 2,500 | Writes the full seven-section plan |
 
 Two rules do the work:
 
@@ -227,6 +246,30 @@ rest as trimmed fact-checking notes.
 > **On a paid plan**, raise `GROQ_TPM_LIMIT` to your real allowance. Every prompt in the
 > graph widens automatically — there is no other number to change.
 
+### Long answers finish across calls
+
+A seven-day itinerary with hourly tables can outrun even a 2,500-token reply budget. Raising
+the cap is not the fix — every token added to the reply is a token taken from the prompt, so a
+bigger cap would starve the draft of the context it is supposed to be polishing.
+
+Instead the writing nodes **resume from their own output**. When Groq reports
+`finish_reason: "length"`, the trailing partial line is discarded and the model is asked to
+continue from the tail of what it has already written:
+
+```mermaid
+flowchart LR
+    A["first call<br/>prompt + reply budget"] --> B{"finish_reason<br/>== length?"}
+    B -->|"no"| DONE["return"]
+    B -->|"yes"| C["drop the partial<br/>trailing line"]
+    C --> D["resend only the last<br/>CONTINUATION_TAIL_CHARS"]
+    D --> E["model continues"]
+    E --> B
+```
+
+The continuation prompt carries roughly a kilobyte of tail instead of the entire original
+context, so each extra round costs a fraction of the first call. After `MAX_CONTINUATIONS`
+rounds the node returns what it has rather than looping forever.
+
 ### When the limit is hit anyway
 
 A full run makes six or more model calls in well under a minute, so *cumulative* usage can
@@ -239,9 +282,25 @@ backoff, preferring the delay Groq itself suggests:
 | `413` / request too large | **Not** retried — waiting cannot shrink a request. Raised with the env var to change |
 | `401` / bad key | Raised immediately, no retries burned |
 
-If you hit limits constantly on the free tier, the cheapest fixes in order are: set
-`GROQ_TPM_LIMIT` to your true limit, lower `GROQ_MAX_COMPLETION_TOKENS`, or point
-`GROQ_MODEL` at a model with a higher free-tier allowance.
+### Choosing a model
+
+Groq's free tier gives `openai/gpt-oss-120b` **30 RPM / 8K TPM / 200K tokens per day** — and
+`openai/gpt-oss-20b` has the *same* 8K TPM, so dropping to the smaller model buys no headroom.
+Limits are set per organisation and Groq notes there are exceptions, so check
+[your own limits page](https://console.groq.com/settings/limits) rather than trusting a table.
+
+In order of value:
+
+1. **Set `GROQ_TPM_LIMIT` to your real allowance.** Every prompt in the graph widens
+   automatically; there is no other number to change.
+2. **Raise the reply budgets** (`ITINERARY_COMPLETION_TOKENS`, `FINAL_COMPLETION_TOKENS`) once
+   the TPM ceiling can afford them — fewer continuation rounds, faster runs.
+3. **Move to a paid tier** if you are planning trips regularly. The 200K tokens-per-day cap
+   works out to roughly 25 full runs, which a day of iterating will exhaust before the
+   per-minute limit does.
+
+Changing `GROQ_MODEL` is worth it only if the target model actually has a higher TPM on your
+plan — verify on the limits page first.
 
 ---
 

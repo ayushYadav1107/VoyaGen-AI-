@@ -78,7 +78,7 @@ export function TopBar({
             )}
 
             <a
-              href="https://github.com"
+              href="https://github.com/ayushYadav1107/VoyaGen-AI-"
               target="_blank"
               rel="noreferrer noopener"
               aria-label="Source"

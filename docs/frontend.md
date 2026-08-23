@@ -76,6 +76,7 @@ Consequences the user actually feels:
 | **`prefers-reduced-motion`** | A global media query collapses every animation to ~0 ms. |
 | **Honest progress** | The backend does not stream, so `PlanSkeleton` shows *named graph stages*, never a fake percentage. |
 | **Health probe** | `GET /health` every 30 s drives the API online/offline pill. |
+| **Humanised errors** | `lib/api.ts`'s `humanise()` rewrites raw Groq error text (oversized request, rate limit, bad key, missing `uv`) into a plain-English, actionable message before it ever reaches `ErrorBanner`. |
 | **Accessible focus** | A visible `:focus-visible` ring, real `<label>`s, `role="alert"` on errors, and semantic `<ol>` for the pipeline. |
 
 ---

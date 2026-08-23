@@ -66,8 +66,34 @@ if not GROQ_API_KEY:
 # numbers, and requests that hit a transient limit are retried with backoff.
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "8000"))
-MAX_COMPLETION_TOKENS = int(os.getenv("GROQ_MAX_COMPLETION_TOKENS", "2000"))
 MAX_LLM_ATTEMPTS = int(os.getenv("GROQ_MAX_RETRIES", "4"))
+
+# Groq screens a request as prompt_tokens + max_tokens against the TPM ceiling,
+# so the completion reservation and the prompt budget are two halves of one
+# number. A node that writes a long document therefore has to be given a
+# *smaller* input allowance, not merely a larger output cap — and a node that
+# answers in strict JSON should not reserve thousands of tokens it never uses.
+COMPLETION_TOKENS = {
+    "guardrail": 400,
+    "supervisor": 800,
+    "flight_agent": 1200,
+    "hotel_agent": 1200,
+    "weather_agent": 1200,
+    "budget_agent": 1500,
+    "itinerary_agent": int(os.getenv("ITINERARY_COMPLETION_TOKENS", "2500")),
+    "final_agent": int(os.getenv("FINAL_COMPLETION_TOKENS", "2500")),
+}
+DEFAULT_COMPLETION_TOKENS = 1500
+
+# Never plan to consume the entire allowance in one request: the provider counts
+# a few tokens this code cannot see (role framing, tool metadata).
+TPM_UTILISATION = float(os.getenv("GROQ_TPM_UTILISATION", "0.90"))
+
+# A long itinerary can still outrun its completion cap. Rather than raise the cap
+# — which would force the prompt budget down and starve the draft of context —
+# the writing nodes resume from the tail of what they have already produced.
+MAX_CONTINUATIONS = int(os.getenv("MAX_CONTINUATIONS", "3"))
+CONTINUATION_TAIL_CHARS = int(os.getenv("CONTINUATION_TAIL_CHARS", "1200"))
 
 # Deliberately pessimistic. Plain English runs ~4 chars/token, but most of what
 # fills these prompts is JSON and tabular tool output, which tokenises far
@@ -82,10 +108,12 @@ SAFETY_MARGIN = 0.85
 MAX_ARTIFACT_CHARS = int(os.getenv("MAX_ARTIFACT_CHARS", "6000"))
 
 
+# max_tokens is deliberately not set here: it is passed per call from
+# COMPLETION_TOKENS, because one global cap either truncates the itinerary or
+# wastes budget on the JSON-only nodes.
 llm = ChatGroq(
     model=GROQ_MODEL,
     api_key=GROQ_API_KEY,
-    max_tokens=MAX_COMPLETION_TOKENS,
 )
 
 
@@ -133,15 +161,23 @@ def _truncate(text, max_chars=1000):
     return cut.rstrip() + "\n...[truncated]"
 
 
-def _prompt_char_budget(reserve_chars: int = 0) -> int:
-    """
-    Characters this process may put in one prompt, leaving room for the reply.
+def _completion_tokens(label: str) -> int:
+    return COMPLETION_TOKENS.get(label, DEFAULT_COMPLETION_TOKENS)
 
-    Derived from the TPM allowance rather than a hardcoded number so that
-    raising GROQ_TPM_LIMIT (paid tier, or a higher-limit model) widens every
-    prompt in the graph without further code changes.
+
+def _prompt_char_budget(reserve_chars: int = 0, label: str = "") -> int:
     """
-    usable_tokens = max(GROQ_TPM_LIMIT - MAX_COMPLETION_TOKENS, 1_000)
+    Characters this process may put in one prompt, given what the reply needs.
+
+    Derived from the TPM allowance rather than a hardcoded number, so raising
+    GROQ_TPM_LIMIT (a paid tier, or a higher-limit model) widens every prompt in
+    the graph with no other change.
+    """
+    reply_tokens = _completion_tokens(label)
+    usable_tokens = max(
+        int(GROQ_TPM_LIMIT * TPM_UTILISATION) - reply_tokens,
+        800,
+    )
     budget = int(usable_tokens * CHARS_PER_TOKEN * SAFETY_MARGIN)
     return max(budget - reserve_chars, 1_000)
 
@@ -234,20 +270,13 @@ class PromptTooLargeError(RuntimeError):
     """A single request exceeded the provider's per-minute token allowance."""
 
 
-def _invoke_llm(messages: list[Any], label: str = "llm"):
-    """
-    Call the model, absorbing transient rate limits.
-
-    The graph makes six-plus calls in quick succession, so on a small TPM
-    allowance the *cumulative* usage trips the limit even when every individual
-    request fits. Backing off and retrying lets the per-minute window roll over
-    instead of failing the whole run.
-    """
+def _call_once(messages: list[Any], label: str, max_tokens: int):
+    """One request, absorbing transient rate limits."""
     last_error: Exception | None = None
 
     for attempt in range(MAX_LLM_ATTEMPTS):
         try:
-            return llm.invoke(messages)
+            return llm.invoke(messages, max_tokens=max_tokens)
         except Exception as exc:
             last_error = exc
             message = str(exc).lower()
@@ -255,9 +284,10 @@ def _invoke_llm(messages: list[Any], label: str = "llm"):
             if any(marker in message for marker in _OVERSIZED_MARKERS):
                 raise PromptTooLargeError(
                     f"The {label} prompt exceeded the per-minute token allowance "
-                    f"for {GROQ_MODEL}. Lower GROQ_MAX_COMPLETION_TOKENS, or set "
-                    f"GROQ_TPM_LIMIT to your actual limit so prompts are budgeted "
-                    f"against it."
+                    f"for {GROQ_MODEL} (reserving {max_tokens} tokens for the "
+                    f"reply). Set GROQ_TPM_LIMIT to your account's real limit so "
+                    f"prompts are budgeted against it, or lower this node's entry "
+                    f"in COMPLETION_TOKENS."
                 ) from exc
 
             if not any(marker in message for marker in _RETRYABLE_MARKERS):
@@ -279,6 +309,113 @@ def _invoke_llm(messages: list[Any], label: str = "llm"):
         f"Free-tier limits are per minute — wait a moment and retry, or upgrade "
         f"the Groq plan."
     ) from last_error
+
+
+def _hit_length_limit(response: Any) -> bool:
+    """True when the model stopped because it ran out of completion tokens."""
+    metadata = getattr(response, "response_metadata", None) or {}
+    return str(metadata.get("finish_reason", "")).lower() == "length"
+
+
+def _split_trailing_partial(text: str) -> str:
+    """
+    Drop the final, incomplete line of a truncated response.
+
+    A cut-off completion almost always ends mid-sentence or mid-table-row.
+    Discarding that fragment means the continuation can start cleanly on a new
+    line instead of trying to resume mid-word.
+    """
+    newline = text.rfind("\n")
+    if newline == -1:
+        return text.rstrip()
+    return text[:newline].rstrip()
+
+
+CONTINUATION_RULES = """
+You are continuing a document that was cut off because it hit a length limit.
+
+Below are the closing lines of what has been written so far.
+
+Continue from exactly where it stops, and follow these rules:
+- Do NOT repeat any text that already appears above.
+- Do NOT add a preamble, apology, heading, or a note that this is a continuation.
+- Keep the same markdown formatting, heading levels and table structure.
+- Complete every remaining section, then stop.
+"""
+
+
+def _invoke_llm(
+    messages: list[Any],
+    label: str = "llm",
+    allow_continuation: bool = False,
+):
+    """
+    Call the model, absorbing rate limits and finishing truncated answers.
+
+    The graph makes six-plus calls in quick succession, so on a small TPM
+    allowance the *cumulative* usage trips the limit even when every individual
+    request fits; backing off lets the per-minute window roll over.
+
+    Separately, the nodes that write a full document can exhaust their
+    completion allowance mid-itinerary. When `allow_continuation` is set, the
+    model is asked to resume from the tail of its own output. Resuming needs
+    only that tail rather than the whole original prompt, so each extra round is
+    far cheaper than the first call.
+    """
+    max_tokens = _completion_tokens(label)
+    response = _call_once(messages, label, max_tokens)
+
+    if not allow_continuation or not _hit_length_limit(response):
+        return response
+
+    system_prompt = next(
+        (m.content for m in messages if isinstance(m, SystemMessage)),
+        "You are a helpful assistant.",
+    )
+    text = _split_trailing_partial(str(response.content))
+
+    for round_number in range(1, MAX_CONTINUATIONS + 1):
+        print(
+            f"[{label}] response hit the length limit, continuing "
+            f"({round_number}/{MAX_CONTINUATIONS})",
+            flush=True,
+        )
+
+        response = _call_once(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(
+                    content=(
+                        f"{CONTINUATION_RULES}\n"
+                        f"--- END OF DOCUMENT SO FAR ---\n"
+                        f"{text[-CONTINUATION_TAIL_CHARS:]}\n"
+                        f"--- CONTINUE FROM HERE ---\n"
+                    )
+                ),
+            ],
+            f"{label}:continuation",
+            max_tokens,
+        )
+
+        addition = str(response.content).strip()
+        if not addition:
+            break
+
+        truncated_again = _hit_length_limit(response)
+        if truncated_again:
+            addition = _split_trailing_partial(addition)
+
+        text = f"{text}\n{addition}".strip()
+
+        if not truncated_again:
+            break
+    else:
+        print(
+            f"[{label}] still incomplete after {MAX_CONTINUATIONS} continuations",
+            flush=True,
+        )
+
+    return AIMessage(content=text)
 
 # =========================
 # Shared helpers
@@ -366,6 +503,7 @@ User request:
             "You are the input guardrail for a travel-planning application. "
             "Return strict JSON only.",
             guardrail_prompt,
+            label="guardrail",
         )
         guardrail_result = _json_from_llm(guardrail_raw)
         allowed = bool(guardrail_result.get("allowed", True))
@@ -426,6 +564,7 @@ User request:
         supervisor_raw = _llm_text(
             "You route work to travel specialist agents. Return strict JSON only.",
             supervisor_prompt,
+            label="supervisor",
         )
         parsed = _json_from_llm(supervisor_raw)
         requested_agents = parsed.get("selected_agents", [])
@@ -515,7 +654,10 @@ def flight_agent(state: TravelState):
         # The reference payloads dominate this prompt, so split whatever room
         # is left after the instruction template between them.
         template_size = len(FLIGHT_AGENT_PROMPT) + len(query)
-        reference_budget = _prompt_char_budget(reserve_chars=template_size + 200)
+        reference_budget = _prompt_char_budget(
+            reserve_chars=template_size + 200,
+            label="flight_agent",
+        )
         per_payload = max(reference_budget // 2, 500)
 
         prompt = FLIGHT_AGENT_PROMPT.format(
@@ -669,7 +811,10 @@ If exact live prices are unavailable, clearly label estimates as approximate.
             ("Hotel Results", state.get("hotel_results", ""), 3),
             ("Weather Results", state.get("weather_results", ""), 1),
         ],
-        _prompt_char_budget(reserve_chars=len(instructions) + 200),
+        _prompt_char_budget(
+            reserve_chars=len(instructions) + 200,
+            label="budget_agent",
+        ),
     )
 
     prompt = f"{instructions}\n{context}\n"
@@ -708,7 +853,10 @@ Create a clear draft that is ready for human review.
             ("Weather Results", state.get("weather_results", ""), 1),
             ("Budget Results", state.get("budget_results", ""), 2),
         ],
-        _prompt_char_budget(reserve_chars=len(instructions) + 200),
+        _prompt_char_budget(
+            reserve_chars=len(instructions) + 200,
+            label="itinerary_agent",
+        ),
     )
 
     prompt = f"{instructions}\n{context}\n"
@@ -719,6 +867,7 @@ Create a clear draft that is ready for human review.
             HumanMessage(content=prompt),
         ],
         label="itinerary_agent",
+        allow_continuation=True,
     )
 
     approval_request = (
@@ -816,7 +965,10 @@ Important:
             ("Weather Notes", state.get("weather_results", ""), 1),
             ("Budget Notes", state.get("budget_results", ""), 2),
         ],
-        _prompt_char_budget(reserve_chars=len(instructions) + 200),
+        _prompt_char_budget(
+            reserve_chars=len(instructions) + 200,
+            label="final_agent",
+        ),
     )
 
     final_prompt = f"{instructions}\n{context}\n"
@@ -829,6 +981,7 @@ Important:
             HumanMessage(content=final_prompt),
         ],
         label="final_agent",
+        allow_continuation=True,
     )
 
     return {

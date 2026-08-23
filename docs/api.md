@@ -73,7 +73,7 @@ then pauses at the human-approval interrupt.
 | `selected_agents` / `supervisor_reasoning` | The supervisor's routing decision and its rationale. |
 | `guardrail_allowed` / `guardrail_reason` | The guardrail verdict. When `false`, no specialist ran. |
 | `flight_results` … `budget_results` | Raw per-agent artifacts, for debugging and per-agent inspection. |
-| `llm_calls` | Cumulative model calls for the thread. |
+| `llm_calls` | Cumulative *node* invocations for the thread — one per graph node, not one per underlying Groq request. A node whose reply gets truncated (see [Token Budgeting](getting-started.md#-token-budgeting)) may issue several Groq requests internally via the continuation loop; those still count as a single `llm_calls` increment. |
 
 Returning the intermediates — not just `answer` — is intentional: a poor final answer can be
 attributed to bad retrieval versus bad synthesis without re-running anything.

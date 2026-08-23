@@ -148,9 +148,9 @@ plain English actually averages, because most of what fills these prompts is JSO
 tabular tool output, which tokenises denser. Guessing high costs a slightly shorter prompt.
 Guessing low costs a rejected request and a failed run, which is far worse.
 
-The same reasoning drives the 15% safety margin and the decision to reserve
-`GROQ_MAX_COMPLETION_TOKENS` up front: the allowance covers prompt *and* reply, so a budget
-that ignores the reply is not a budget.
+The same reasoning drives the safety margin (`GROQ_TPM_UTILISATION`, 90% by default) and the
+decision to reserve each node's `COMPLETION_TOKENS` entry up front: the allowance covers
+prompt *and* reply combined, so a budget that ignores the reply is not a budget.
 
 </details>
 
@@ -168,6 +168,29 @@ The draft is now weighted as the primary source at roughly 55–60% of the promp
 artifacts passed as trimmed notes for fact-checking. The final pass is a polish-and-format
 step over an already-reasoned document, not a second synthesis from raw retrieval, so the
 notes only need to be long enough to catch a contradiction.
+
+</details>
+
+<details>
+<summary><b>Why continue a truncated answer instead of just raising the token cap?</b></summary>
+
+<br>
+
+Because the cap and the prompt budget are the same number. Groq screens a request as
+`prompt_tokens + max_tokens` against the per-minute ceiling, so every token handed to the
+reply is taken from the context. Raising `final_agent`'s cap to fit a seven-day itinerary
+would starve it of the draft it is meant to be polishing — trading a truncated answer for a
+worse-informed one.
+
+Continuing costs far less. The resume prompt carries about a kilobyte of the model's own tail
+instead of the entire original context, so a second round is a fraction of the first call.
+That makes output length effectively independent of the TPM ceiling, which is the property
+actually wanted: the ceiling should limit how much *context* a node can consider, not how many
+days a trip can have.
+
+The trailing partial line is discarded before resuming. A cut-off completion almost always
+ends mid-sentence or mid-table-row, and asking a model to continue mid-word produces worse
+seams than asking it to rewrite one clean line.
 
 </details>
 
@@ -207,6 +230,9 @@ Stated plainly, because knowing where a system is weak is part of building it:
 - **Long artifacts are truncated, not summarised.** `MAX_ARTIFACT_CHARS` cuts on a line
   boundary and appends a marker. A summarisation pass would preserve more signal per token,
   at the cost of another model call per agent.
+- **Continuation seams are not verified.** The model is instructed not to repeat itself when
+  resuming, but nothing checks the join. A duplicated heading is possible on an unlucky
+  continuation, and a deterministic overlap check would catch it.
 - **`uvx` is a hard dependency** for the flight agent. It is installed in the Docker image, but a
   bare-metal deploy needs `uv` on `PATH` or the flight agent degrades to its fallback message.
 - **Guardrail fails open.** A malformed classifier response allows the request through. That is a
@@ -229,6 +255,8 @@ Stated plainly, because knowing where a system is weak is part of building it:
       retrieval loses signal rather than just tail bytes
 - [ ] **Token accounting from the provider response** (`usage.prompt_tokens`) to replace the
       character estimate with measured values
+- [ ] **Overlap detection on continuation joins**, so a repeated line at the seam is removed
+      rather than trusted away by the prompt
 - [ ] **Evaluation harness** — a golden set scored on groundedness, section completeness, budget adherence, and routing precision/recall
 - [ ] **Test suite** — `pytest` for the supervisor JSON contract, mocked MCP tool tests, and graph-level integration tests including the interrupt/resume cycle
 - [ ] **Multi-turn threads** — follow-up questions against a finalised plan on the same `thread_id`

@@ -21,7 +21,7 @@ function humanise(raw: string): string {
     return (
       "The request exceeded the model's per-minute token allowance. " +
       "Set GROQ_TPM_LIMIT in .env to your actual limit so prompts are budgeted " +
-      "against it, or lower GROQ_MAX_COMPLETION_TOKENS."
+      "against it, or lower ITINERARY_COMPLETION_TOKENS / FINAL_COMPLETION_TOKENS."
     );
   }
 
