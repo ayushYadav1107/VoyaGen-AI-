@@ -5,3 +5,32 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Secrets — never bake credentials into an image layer
+.env
+.env.*
+!.env.example
+
+# Node — the UI is built in its own stage from source
+frontend/node_modules
+frontend/dist
+**/node_modules
+*.tsbuildinfo
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# VCS + editors
+.git
+.gitignore
+.vscode/
+.idea/
+
+# Docs and media are not needed at runtime
+assets/
+README.md
+frontend/README.md

@@ -8,19 +8,31 @@ const QUICK_PROMPTS = [
     flag: "🇯🇵",
     title: "Japan · 7 days",
     prompt:
-      "Plan a complete 7 days Japan trip from Bangladesh including flights, hotels and sightseeing under 2 lakhs.",
+      "Plan a complete 7 days Japan trip from Delhi including flights, hotels and sightseeing under 2 lakhs.",
   },
   {
     flag: "🇦🇪",
     title: "Dubai · 5 days",
     prompt:
-      "Plan a 5 days Dubai trip from Dhaka with flights, hotels and sightseeing.",
+      "Plan a 5 days Dubai trip from Mumbai with flights, hotels and sightseeing.",
   },
   {
     flag: "🇹🇭",
-    title: "Thailand · 7 days",
+    title: "Thailand · 6 days",
     prompt:
-      "Plan a 7 days Thailand trip from Bangladesh with budget hotels and sightseeing.",
+      "Plan a 6 days Thailand trip from Bengaluru with budget hotels and sightseeing.",
+  },
+  {
+    flag: "🇻🇳",
+    title: "Vietnam · 8 days",
+    prompt:
+      "Plan an 8 days Vietnam trip from Hyderabad covering Hanoi and Da Nang under 1.5 lakhs.",
+  },
+  {
+    flag: "🏔️",
+    title: "Himachal · 5 days",
+    prompt:
+      "Plan a 5 days Himachal trip from Chennai with hotels, weather advice and a day-by-day plan.",
   },
   {
     flag: "🌍",
@@ -139,7 +151,7 @@ export function PlannerCard({
               onKeyDown={handleKeyDown}
               disabled={locked}
               rows={3}
-              placeholder="Plan a complete 7 days Japan trip including flights, hotels and sightseeing under 2 lakhs…"
+              placeholder="Plan a complete 7 days Japan trip from Delhi including flights, hotels and sightseeing under 2 lakhs…"
               className={cn(
                 "w-full resize-none rounded-2xl bg-transparent px-4 py-3.5 pr-4 text-[15px] leading-relaxed outline-none transition-colors duration-300 sm:pr-40",
                 locked && "cursor-not-allowed opacity-60",
@@ -213,7 +225,7 @@ export function PlannerCard({
           {/* Quick prompts */}
           <div className="mt-6">
             <p className="label-eyebrow mb-3">Try one of these</p>
-            <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
               {QUICK_PROMPTS.map((item, index) => (
                 <motion.button
                   key={item.title}

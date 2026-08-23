@@ -10,10 +10,12 @@ os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
 from typing import Any, TypedDict, Annotated
 import operator
+import re
+import time
 import uuid
 import asyncio
-import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command, interrupt
@@ -53,9 +55,37 @@ if not GROQ_API_KEY:
 # LLM
 # =========================
 
+# =========================
+# Rate-limit budgeting
+# =========================
+# Groq bills prompt + completion tokens against a single tokens-per-minute
+# allowance. On the free tier that allowance is small (8k TPM for
+# gpt-oss-120b), which is smaller than a naive "concatenate every artifact"
+# prompt — the API then rejects the request outright with HTTP 413 rather than
+# queueing it. Every prompt in this module is therefore budgeted against these
+# numbers, and requests that hit a transient limit are retried with backoff.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "8000"))
+MAX_COMPLETION_TOKENS = int(os.getenv("GROQ_MAX_COMPLETION_TOKENS", "2000"))
+MAX_LLM_ATTEMPTS = int(os.getenv("GROQ_MAX_RETRIES", "4"))
+
+# Deliberately pessimistic. Plain English runs ~4 chars/token, but most of what
+# fills these prompts is JSON and tabular tool output, which tokenises far
+# denser — closer to 3. Guessing high here costs a slightly shorter prompt;
+# guessing low costs a rejected request.
+CHARS_PER_TOKEN = 3
+SAFETY_MARGIN = 0.85
+
+# Longest artifact we will keep in TravelState. Raw Tavily payloads can run to
+# tens of kilobytes; storing them whole bloats every checkpoint and guarantees
+# the downstream prompt has to throw most of it away anyway.
+MAX_ARTIFACT_CHARS = int(os.getenv("MAX_ARTIFACT_CHARS", "6000"))
+
+
 llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    api_key=GROQ_API_KEY
+    model=GROQ_MODEL,
+    api_key=GROQ_API_KEY,
+    max_tokens=MAX_COMPLETION_TOKENS,
 )
 
 
@@ -94,7 +124,161 @@ def _truncate(text, max_chars=1000):
     text = str(text)
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + "\n...[truncated]"
+    # Cut on a newline when one is close to the limit, so a trimmed artifact
+    # ends on a whole line instead of mid-token.
+    cut = text[:max_chars]
+    breakpoint_ = cut.rfind("\n")
+    if breakpoint_ > max_chars * 0.6:
+        cut = cut[:breakpoint_]
+    return cut.rstrip() + "\n...[truncated]"
+
+
+def _prompt_char_budget(reserve_chars: int = 0) -> int:
+    """
+    Characters this process may put in one prompt, leaving room for the reply.
+
+    Derived from the TPM allowance rather than a hardcoded number so that
+    raising GROQ_TPM_LIMIT (paid tier, or a higher-limit model) widens every
+    prompt in the graph without further code changes.
+    """
+    usable_tokens = max(GROQ_TPM_LIMIT - MAX_COMPLETION_TOKENS, 1_000)
+    budget = int(usable_tokens * CHARS_PER_TOKEN * SAFETY_MARGIN)
+    return max(budget - reserve_chars, 1_000)
+
+
+def _fit_sections(
+    sections: list[tuple[str, Any, int]],
+    budget: int,
+) -> str:
+    """
+    Render labelled context blocks that together fit inside `budget` chars.
+
+    Each section declares a weight. Weights set the initial share, but any
+    allowance a short section does not use is handed back to the sections that
+    are over their share — so a two-line weather payload does not cost the
+    draft itinerary any room.
+    """
+    # `str(None)` is "None", which would otherwise render as literal text in
+    # the prompt, so missing values are normalised to empty before filtering.
+    items = [
+        (label, text, weight)
+        for label, text, weight in (
+            (label, "" if value is None else str(value).strip(), weight)
+            for label, value, weight in sections
+        )
+        if text
+    ]
+    if not items:
+        return ""
+
+    # "Label:\n" plus the blank line between blocks.
+    overhead = sum(len(label) + 4 for label, _, _ in items)
+    budget = max(budget - overhead, 500)
+
+    total_weight = sum(weight for _, _, weight in items) or 1
+    shares = {
+        label: max(int(budget * weight / total_weight), 120)
+        for label, _, weight in items
+    }
+
+    spare = sum(
+        shares[label] - len(text)
+        for label, text, _ in items
+        if len(text) < shares[label]
+    )
+    hungry = [(l, t, w) for l, t, w in items if len(t) > shares[l]]
+
+    if hungry and spare > 0:
+        hungry_weight = sum(weight for _, _, weight in hungry) or 1
+        for label, _, weight in hungry:
+            shares[label] += int(spare * weight / hungry_weight)
+
+    return "\n\n".join(
+        f"{label}:\n{_truncate(text, shares[label])}"
+        for label, text, _ in items
+    )
+
+
+# =========================
+# Rate-limit aware invocation
+# =========================
+_RETRYABLE_MARKERS = (
+    "rate_limit_exceeded",
+    "rate limit",
+    "429",
+    "please try again",
+    "service unavailable",
+    "502",
+    "503",
+)
+
+# Groq returns this when a *single* request exceeds the whole per-minute
+# allowance. Waiting cannot help — the prompt itself has to shrink.
+_OVERSIZED_MARKERS = ("request too large", "reduce your message size")
+
+
+def _retry_delay(message: str, attempt: int) -> float:
+    """Prefer the provider's own hint, else exponential backoff."""
+    match = re.search(r"try again in ([0-9.]+)\s*s", message, re.IGNORECASE)
+    if match:
+        return min(float(match.group(1)) + 0.5, 65.0)
+
+    match = re.search(r"retry-after[\"']?\s*[:=]\s*([0-9.]+)", message, re.IGNORECASE)
+    if match:
+        return min(float(match.group(1)) + 0.5, 65.0)
+
+    return min(2.0 ** attempt * 2.0, 60.0)
+
+
+class PromptTooLargeError(RuntimeError):
+    """A single request exceeded the provider's per-minute token allowance."""
+
+
+def _invoke_llm(messages: list[Any], label: str = "llm"):
+    """
+    Call the model, absorbing transient rate limits.
+
+    The graph makes six-plus calls in quick succession, so on a small TPM
+    allowance the *cumulative* usage trips the limit even when every individual
+    request fits. Backing off and retrying lets the per-minute window roll over
+    instead of failing the whole run.
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(MAX_LLM_ATTEMPTS):
+        try:
+            return llm.invoke(messages)
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+
+            if any(marker in message for marker in _OVERSIZED_MARKERS):
+                raise PromptTooLargeError(
+                    f"The {label} prompt exceeded the per-minute token allowance "
+                    f"for {GROQ_MODEL}. Lower GROQ_MAX_COMPLETION_TOKENS, or set "
+                    f"GROQ_TPM_LIMIT to your actual limit so prompts are budgeted "
+                    f"against it."
+                ) from exc
+
+            if not any(marker in message for marker in _RETRYABLE_MARKERS):
+                raise
+
+            if attempt == MAX_LLM_ATTEMPTS - 1:
+                break
+
+            delay = _retry_delay(str(exc), attempt)
+            print(
+                f"[{label}] rate limited, retrying in {delay:.1f}s "
+                f"(attempt {attempt + 2}/{MAX_LLM_ATTEMPTS})",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"The {label} step was rate limited {MAX_LLM_ATTEMPTS} times by Groq. "
+        f"Free-tier limits are per minute — wait a moment and retry, or upgrade "
+        f"the Groq plan."
+    ) from last_error
 
 # =========================
 # Shared helpers
@@ -116,12 +300,13 @@ AGENT_ORDER = [
 ]
 
 
-def _llm_text(system_prompt: str, user_prompt: str) -> str:
-    response = llm.invoke(
+def _llm_text(system_prompt: str, user_prompt: str, label: str = "llm") -> str:
+    response = _invoke_llm(
         [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt),
-        ]
+        ],
+        label=label,
     )
     return str(response.content)
 
@@ -321,34 +506,49 @@ Return concise travel guidance.
 """
 
 def flight_agent(state: TravelState):
-    print("\nINSIDE FLIGHT AGENT\n")
     query = state["user_query"]
 
     try:
         airports = asyncio.run(aviation_mcp_call("list_airports"))
         airlines = asyncio.run(aviation_mcp_call("list_airlines"))
 
-        print("\nAIRPORTS:", airports)
-        print("\nAIRLINES:", airlines)
+        # The reference payloads dominate this prompt, so split whatever room
+        # is left after the instruction template between them.
+        template_size = len(FLIGHT_AGENT_PROMPT) + len(query)
+        reference_budget = _prompt_char_budget(reserve_chars=template_size + 200)
+        per_payload = max(reference_budget // 2, 500)
 
         prompt = FLIGHT_AGENT_PROMPT.format(
             query=query,
-            airport_data=str(airports)[:3000],
-            airline_data=str(airlines)[:3000],
+            airport_data=_truncate(str(airports), per_payload),
+            airline_data=_truncate(str(airlines), per_payload),
         )
 
-        response = llm.invoke(
+        response = _invoke_llm(
             [
                 SystemMessage(content="You are an expert travel flight planner."),
                 HumanMessage(content=prompt),
-            ]
+            ],
+            label="flight_agent",
         )
-        flight_data = response.content
+        flight_data = str(response.content)
     except Exception as exc:
-        flight_data = f"Flight information unavailable: {exc}"
+        # Note what failed, but never inline the raw exception: provider errors
+        # can be multi-kilobyte JSON, and this string is fed into every
+        # downstream prompt.
+        print(
+            f"FLIGHT AGENT ERROR: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        flight_data = (
+            "Live flight lookup is temporarily unavailable "
+            f"({type(exc).__name__}). Give general routing, airline and "
+            "booking guidance for this journey and clearly label it as "
+            "non-live advice."
+        )
 
     return {
-        "flight_results": flight_data,
+        "flight_results": _truncate(flight_data, MAX_ARTIFACT_CHARS),
         "messages": [AIMessage(content="Flight recommendations generated")],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
@@ -383,7 +583,7 @@ def hotel_agent(state: TravelState):
         )
 
     return {
-        "hotel_results": hotel_results,
+        "hotel_results": _truncate(str(hotel_results), MAX_ARTIFACT_CHARS),
         "messages": [
             AIMessage(
                 content="Hotel information processed."
@@ -436,7 +636,7 @@ Forecast:
         )
 
     return {
-        "weather_results": weather_results,
+        "weather_results": _truncate(str(weather_results), MAX_ARTIFACT_CHARS),
         "messages": [
             AIMessage(
                 content="Weather information processed."
@@ -449,23 +649,8 @@ Forecast:
 # =========================
 
 def budget_agent(state: TravelState):
-    prompt = f"""
+    instructions = """
 Analyze whether this trip is realistic for the user's budget.
-
-User Query:
-{state['user_query']}
-
-Trip Constraints:
-{state.get('trip_constraints', {})}
-
-Flight Results:
-{state.get('flight_results', '')}
-
-Hotel Results:
-{state.get('hotel_results', '')}
-
-Weather Results:
-{state.get('weather_results', '')}
 
 Return:
 1. Estimated cost categories
@@ -476,15 +661,29 @@ Return:
 If exact live prices are unavailable, clearly label estimates as approximate.
 """
 
-    response = llm.invoke(
+    context = _fit_sections(
+        [
+            ("User Query", state["user_query"], 2),
+            ("Trip Constraints", state.get("trip_constraints", {}), 1),
+            ("Flight Results", state.get("flight_results", ""), 3),
+            ("Hotel Results", state.get("hotel_results", ""), 3),
+            ("Weather Results", state.get("weather_results", ""), 1),
+        ],
+        _prompt_char_budget(reserve_chars=len(instructions) + 200),
+    )
+
+    prompt = f"{instructions}\n{context}\n"
+
+    response = _invoke_llm(
         [
             SystemMessage(content="You are a practical travel budget analyst."),
             HumanMessage(content=prompt),
-        ]
+        ],
+        label="budget_agent",
     )
 
     return {
-        "budget_results": response.content,
+        "budget_results": _truncate(str(response.content), MAX_ARTIFACT_CHARS),
         "messages": [AIMessage(content="Budget assessment generated.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
@@ -493,36 +692,33 @@ If exact live prices are unavailable, clearly label estimates as approximate.
 # Itinerary Agent
 # =========================
 def itinerary_agent(state: TravelState):
-    prompt = f"""
+    instructions = """
 Create a complete travel itinerary.
-
-User Query:
-{state['user_query']}
-
-Trip Constraints:
-{state.get('trip_constraints', {})}
-
-Flight Results:
-{state.get('flight_results', '')}
-
-Hotel Results:
-{state.get('hotel_results', '')}
-
-Weather Results:
-{state.get('weather_results', '')}
-
-Budget Results:
-{state.get('budget_results', '')}
 
 Make the itinerary practical, budget-aware, and easy to follow.
 Create a clear draft that is ready for human review.
 """
 
-    response = llm.invoke(
+    context = _fit_sections(
+        [
+            ("User Query", state["user_query"], 2),
+            ("Trip Constraints", state.get("trip_constraints", {}), 2),
+            ("Flight Results", state.get("flight_results", ""), 3),
+            ("Hotel Results", state.get("hotel_results", ""), 3),
+            ("Weather Results", state.get("weather_results", ""), 1),
+            ("Budget Results", state.get("budget_results", ""), 2),
+        ],
+        _prompt_char_budget(reserve_chars=len(instructions) + 200),
+    )
+
+    prompt = f"{instructions}\n{context}\n"
+
+    response = _invoke_llm(
         [
             SystemMessage(content="You are an expert travel planner."),
             HumanMessage(content=prompt),
-        ]
+        ],
+        label="itinerary_agent",
     )
 
     approval_request = (
@@ -531,7 +727,7 @@ Create a clear draft that is ready for human review.
     )
 
     return {
-        "itinerary": response.content,
+        "itinerary": _truncate(str(response.content), MAX_ARTIFACT_CHARS * 2),
         "approval_request": approval_request,
         "messages": [AIMessage(content="Draft itinerary created for human review.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
@@ -579,32 +775,15 @@ The user requested a revision. Apply this feedback carefully:
 {state.get('human_feedback', '') or 'Improve the draft before finalizing it.'}
 """
 
-    final_prompt = f"""
+    instructions = f"""
 Generate the final travel response for the user.
+
+The draft itinerary below is the primary source. It already synthesises the
+flight, hotel, weather and budget research, so treat the supporting notes as
+fact-checking references rather than material to restate in full.
 
 Human Review:
 {review_instruction}
-
-User Request:
-{state['user_query']}
-
-Supervisor Constraints:
-{state.get('trip_constraints', {})}
-
-Flights:
-{state.get('flight_results', '')}
-
-Hotels:
-{state.get('hotel_results', '')}
-
-Weather:
-{state.get('weather_results', '')}
-
-Budget Analysis:
-{state.get('budget_results', '')}
-
-Draft Itinerary:
-{state.get('itinerary', '')}
 
 Format the final answer beautifully using these sections:
 1. Trip Summary
@@ -623,13 +802,33 @@ Important:
 - Incorporate the human feedback when revision was requested.
 """
 
-    response = llm.invoke(
+    # The draft carries most of the weight here. Re-sending every raw artifact
+    # at full length is what pushed this single request past the whole
+    # per-minute token allowance, and it was largely redundant: the draft is a
+    # synthesis of exactly those artifacts.
+    context = _fit_sections(
+        [
+            ("User Request", state["user_query"], 1),
+            ("Supervisor Constraints", state.get("trip_constraints", {}), 1),
+            ("Draft Itinerary (primary source)", state.get("itinerary", ""), 10),
+            ("Flight Notes", state.get("flight_results", ""), 2),
+            ("Hotel Notes", state.get("hotel_results", ""), 2),
+            ("Weather Notes", state.get("weather_results", ""), 1),
+            ("Budget Notes", state.get("budget_results", ""), 2),
+        ],
+        _prompt_char_budget(reserve_chars=len(instructions) + 200),
+    )
+
+    final_prompt = f"{instructions}\n{context}\n"
+
+    response = _invoke_llm(
         [
             SystemMessage(
                 content="You are a professional AI travel booking assistant."
             ),
             HumanMessage(content=final_prompt),
-        ]
+        ],
+        label="final_agent",
     )
 
     return {
@@ -714,34 +913,37 @@ graph.add_edge("final_agent", END)
 graph.add_edge("guardrail_blocked", END)
 
 # =========================
-# PostgreSQL Checkpointer - original persistence kept
-# =========================
-DATABASE_URL = get_database_url()
-_conn = psycopg.connect(
-    DATABASE_URL,
-    autocommit=True,
-    row_factory=dict_row,
-)
-checkpointer = PostgresSaver(_conn)
-checkpointer.setup()
-
-travel_graph = graph.compile(checkpointer=checkpointer) 
-
-# =========================
 # PostgreSQL Checkpointer
 # =========================
+# A pooled connection rather than a single blocking one: a graph run holds its
+# connection for the whole request (six-plus LLM calls, several MCP round-trips),
+# so one shared connection serialises every concurrent request behind the slowest.
 DATABASE_URL = get_database_url()
 
-_conn = psycopg.connect(
-    DATABASE_URL,
-    autocommit=True,
-    row_factory=dict_row
+_pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=int(os.getenv("DB_POOL_MAX_SIZE", "10")),
+    # PostgresSaver requires all three: autocommit for its own transaction
+    # handling, dict rows for checkpoint deserialisation, and prepare_threshold=0
+    # because pooled connections are recycled across differing statements.
+    kwargs={
+        "autocommit": True,
+        "row_factory": dict_row,
+        "prepare_threshold": 0,
+    },
+    open=True,
 )
 
-checkpointer = PostgresSaver(_conn)
-checkpointer.setup()
+checkpointer = PostgresSaver(_pool)
+checkpointer.setup()  # idempotent schema migration
 
 travel_graph = graph.compile(checkpointer=checkpointer)
+
+
+def close_checkpointer() -> None:
+    """Release the connection pool. Called from the FastAPI lifespan handler."""
+    _pool.close()
 
 # =========================
 # FastAPI-facing helpers
