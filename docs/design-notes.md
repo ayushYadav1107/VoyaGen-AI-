@@ -131,8 +131,7 @@ no longer paused.
 Modelling the client as an explicit state machine in `useTravelPlanner()` makes those states
 unrepresentable, and TypeScript types mirroring `_serialize_result()` turn a backend field rename
 into a compile error instead of a silently blank panel. The cost is a Node toolchain in the build
-— which is why `templates/` and `static/` are kept so `python app.py` alone still serves a
-working UI.
+— worth it, and the original vanilla page has been removed.
 
 </details>
 

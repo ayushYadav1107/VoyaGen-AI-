@@ -51,8 +51,7 @@ VoyaGen_AI/
 │           ├── agents.ts              # Agent metadata: label, icon, colour, blurb
 │           └── utils.ts               # cn(), word/reading counts
 │
-├── templates/index.html           # Legacy Jinja2 shell (superseded by frontend/)
-├── static/                        # Legacy CSS + JS (superseded by frontend/)
+├── tests/                         # pytest suite (no DB / API keys needed)
 │
 ├── assets/
 │   ├── architecture.png           # End-to-end architecture diagram
@@ -65,9 +64,6 @@ VoyaGen_AI/
 ├── LICENSE                        # MIT
 └── README.md
 ```
-
-> `templates/` and `static/` are the original vanilla front end. They are kept so `python app.py`
-> still serves a working UI with no Node toolchain installed; `frontend/` is the maintained one.
 
 ---
 
@@ -341,15 +337,14 @@ That is the whole step — no code change and no second server. The wiring is:
 
 | Path | Served from |
 | --- | --- |
-| `/` | `frontend/dist/index.html` when built, else the legacy `templates/index.html` |
+| `/` | `frontend/dist/index.html` when built, else a 503 hint |
 | `/assets/*` | `frontend/dist/assets/` — Vite's hashed bundles |
-| `/static/*` | The legacy CSS/JS, still mounted |
 | `/api/*`, `/health`, `/docs`, `/redoc` | Unchanged |
 
 `GET /health` reports which UI is live, so a deploy that forgot to build is obvious:
 
 ```json
-{ "status": "ok", "frontend": "react" }     // or "legacy_template"
+{ "status": "ok", "frontend": "react" }     // or "not_built"
 ```
 
 > The SPA is served by an explicit `/` route rather than a `StaticFiles(html=True)` catch-all

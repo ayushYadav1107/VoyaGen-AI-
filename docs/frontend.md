@@ -9,7 +9,7 @@
 ## 🎨 Frontend Architecture
 
 The front end is a **Vite + React 18 + TypeScript** SPA in `frontend/`, styled with Tailwind and
-animated with Framer Motion. It is a rewrite of the original Jinja2 + vanilla-JS page, built to
+animated with Framer Motion. It is a rewrite of the original vanilla-JS page, built to
 mirror the graph's phases rather than just render its output.
 
 ```mermaid

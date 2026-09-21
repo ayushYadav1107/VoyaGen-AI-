@@ -1,7 +1,7 @@
 # VoyaGen AI · Frontend
 
 Vite + React 18 + TypeScript + Tailwind CSS + Framer Motion.
-This is the maintained UI; `../templates/` and `../static/` are the legacy vanilla version.
+This is the maintained UI.
 
 ## Develop
 

@@ -112,7 +112,7 @@ final plan, and `approved` / `human_feedback` echoing the decision.
 }
 ```
 
-`frontend` is `"react"` when `frontend/dist` exists and `"legacy_template"` otherwise — a cheap
+`frontend` is `"react"` when `frontend/dist` exists and `"not_built"` otherwise — a cheap
 way to confirm a deploy actually shipped the built UI. The React client polls this endpoint every
 30 seconds to drive its API online/offline pill.
 

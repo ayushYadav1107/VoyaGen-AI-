@@ -3,10 +3,9 @@ from pathlib import Path
 import traceback
 
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from backend import close_checkpointer, run_travel_agent, resume_travel_agent
@@ -19,8 +18,7 @@ nest_asyncio.apply()
 BASE_DIR = Path(__file__).resolve().parent
 
 # Production build of the React front end (frontend/). Absent until
-# `cd frontend && npm run build` has been run, in which case the legacy
-# Jinja2 template in templates/ is served instead.
+# `cd frontend && npm run build` has been run, in which case `/` returns a hint.
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 SPA_INDEX = FRONTEND_DIST / "index.html"
 SPA_ASSETS = FRONTEND_DIST / "assets"
@@ -43,12 +41,6 @@ app = FastAPI(
     version="2.0.0",
 )
 
-app.mount(
-    "/static",
-    StaticFiles(directory=str(BASE_DIR / "static")),
-    name="static",
-)
-
 # Vite emits hashed bundles under dist/assets/. Mounted at the same path the
 # built index.html references, so no rewriting is needed.
 if SPA_ASSETS.is_dir():
@@ -57,9 +49,6 @@ if SPA_ASSETS.is_dir():
         StaticFiles(directory=str(SPA_ASSETS)),
         name="spa-assets",
     )
-
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-
 
 class TravelRequest(BaseModel):
     message: str
@@ -72,16 +61,15 @@ class ApprovalRequest(BaseModel):
     feedback: str = ""
 
 
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    """Serve the React build when present, otherwise the legacy Jinja2 page."""
+@app.get("/")
+async def home():
+    """Serve the React build; without it, say how to build it."""
     if SPA_INDEX.is_file():
         return FileResponse(SPA_INDEX)
 
-    return templates.TemplateResponse(
-        request=request,
-        name="index.html",
-        context={},
+    return JSONResponse(
+        status_code=503,
+        content={"error": "Frontend not built. Run: cd frontend && npm run build"},
     )
 
 
@@ -173,7 +161,7 @@ async def health_check():
             "mcp_tool_fabric",
             "human_in_the_loop",
         ],
-        "frontend": "react" if SPA_INDEX.is_file() else "legacy_template",
+        "frontend": "react" if SPA_INDEX.is_file() else "not_built",
     }
 
 

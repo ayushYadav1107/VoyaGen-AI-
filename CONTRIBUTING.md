@@ -35,6 +35,7 @@ the supervisor prompt describing when to select it.
 
 ```bash
 python -c "import ast,sys; [ast.parse(open(f,encoding='utf-8').read()) for f in ('app.py','backend.py','mcp_client.py')]"
+pip install -r requirements-dev.txt && pytest
 cd frontend && npm run typecheck && npm run build
 ```
 
